@@ -1,0 +1,758 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+#flow:定義驗證model、MLT_NET架構、Dataset架構、分data_type(num.cat)、把下一小時的溫度跟用電當label，
+#分訓練集、測試集、把用電=0&<1000刪除、填補fill na、將2020/11以後當驗證集、
+#將訓練集、測試集、驗證集的feature跟label聚集成array，再定義data_loader、
+#定義完整的訓練、驗證模型架構，分別有計算溫度跟用電的loss並做backward
+#定義訓練中的模式架構(把weight當超參數，將溫度的loss*165+上用電的loss、early stop)
+#最後用ensemble的方式，把十個model預測的結果取平均
+
+# %%
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
+
+
+# %%
+
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.utils import validation
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime
+from sklearn.model_selection import GridSearchCV
+
+
+# %%
+
+
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.utils import validation
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision
+import torchvision.transforms as transforms
+import torch.nn.functional as F
+
+
+# %%
+
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+
+#columntransformer將數值型&類別型資料分別做標準化跟one hot
+
+# %%
+
+
+def saveModel(model, modelFileName, stateFileName):
+    torch.save(model, modelFileName)
+    torch.save(model.state_dict(), stateFileName)
+    
+def modelEvaluation(model, test_loader):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for test_samples, test_main_labels, test_aux_labels in test_loader:
+            test_samples = test_samples.to(device)
+            test_main_labels = test_main_labels.to(device)
+            test_outputs_main, test_outputs_aux = model(test_samples)
+            test_outputs_main = torch.squeeze(test_outputs_main, dim=1)
+            predictions.extend(test_outputs_main.cpu().detach().numpy())
+    return predictions
+
+#orch.squeeze() 这个函数主要对数据的维度进行压缩，
+# 去掉维数为1的的维度，比如是一行或者一列这种
+
+# %%
+class MTLNet(nn.Module):
+    def __init__(self, input_size):
+        super(MTLNet, self).__init__()
+        self.input_size = input_size
+
+        # shared network
+        self.sharedNetwork = nn.Sequential(
+            nn.Linear(self.input_size, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+
+            nn.Linear(32, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+
+        )
+
+        self.mainTaskNet = nn.Sequential(
+            nn.Linear(16, 8),
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
+
+            nn.Linear(8, 1)
+        )
+
+        self.auxTaskNet = nn.Sequential(
+            nn.Linear(16, 8),
+            nn.BatchNorm1d(8),
+            nn.ReLU(),
+
+            nn.Linear(8, 1)
+            
+        )
+
+    def forward(self, x):
+
+        x_shared = self.sharedNetwork(x)
+        output_main = self.mainTaskNet(x_shared)
+        output_aux = self.auxTaskNet(x_shared)
+
+        return output_main, output_aux
+
+
+# %%
+
+
+class ArrayDataset(Dataset):
+    def __init__(self, df, main_label_vec, aux_label_vec, transform=None):
+        self.df = df
+        self.main_label_vec = main_label_vec
+        self.aux_label_vec = aux_label_vec
+        self.transform = transform
+
+    def __len__(self):
+        return self.df.shape[0]
+
+    def __getitem__(self, idx):
+        feature = self.df[idx,:]
+        main_label = self.main_label_vec[idx]
+        aux_label = self.aux_label_vec[idx]
+
+        main_label = torch.tensor(main_label).float()
+        aux_label = torch.tensor(aux_label).float()
+        data = torch.tensor(feature).float()
+
+        if self.transform:
+            data = self.transform(data)
+
+        return (data, main_label, aux_label)
+
+
+# %%
+
+
+# dealing with data types
+cat_features = ['Season', 'Weekend']
+int_features = ['Year', 'Month', 'Day', 'Hour']
+num_features = ['Temperature', 'Pressure',
+                'Humidity', 'Wind_Speed', 'Rainfall']
+dtype_dict = {c: 'category' for c in cat_features}
+int_dict = {c: np.int32 for c in int_features}
+num_dict = {c: np.float32 for c in num_features}
+dtype_dict.update(int_dict)
+dtype_dict.update(num_dict)
+
+
+# %%
+
+
+df = pd.read_csv('C:/Users/user/Desktop/負載規劃/2021/muti-task learning/data_NA.csv', dtype=dtype_dict)
+df['Date'] = df['Year'].astype(str) + '-' + df['Month'].astype(str) + '-' + df['Day'].astype(
+    str) + ' ' + df['Hour'].astype(str).apply(lambda e: '{:02d}'.format(int(e)))
+
+#%%
+print(df)
+# %%
+
+
+# df['Date'] = df['Year'].apply(str) + '-' + df['Month'].apply(str) + '-' + \
+#                               df['Day'].apply(
+#                                   str) + ' ' + df['Hour'].apply(lambda e: '{:02}'.format(e))
+df['Date'] = pd.to_datetime(df['Date'], format='%Y-%m-%d %H')
+df.set_index('Date', inplace=True)
+df = df.sort_index()
+
+
+# %%
+#把下一小時的溫度跟用電量當作這一小時的label
+
+df['Next_Hour_Load'] = df['Load'].shift(-1)
+df['Next_Hour_Temperature'] = df['Temperature'].shift(-1)
+filt = df['Next_Hour_Load'].isnull()
+df.loc[filt, ['Next_Hour_Load', 'Next_Hour_Temperature']] = [1696.8, 22.0]
+
+#loc 基於行標籤和列標籤（x_label、y_label）進行索引
+#取前兩行對應資料，先行後列
+#frame.loc['a':'b',:]
+
+# iloc基於行索引和列索引（index，columns） 都是從 0 開始
+#取前兩行對應資料
+#frame.iloc[0:2,:]
+
+# %%
+
+
+filt_train = (df.index < '2021-01-01')
+filt_test = (df.index >= '2021-01-01')
+df_train = df.loc[filt_train]
+df_test = df.loc[filt_test]
+
+# %%
+
+
+features = ['Year', 'Month', 'Day', 'Hour', 'Weekend', 'Season',
+            'Temperature', 'Pressure', 'Humidity', 'Wind_Speed', 'Rainfall']
+main_label = 'Next_Hour_Load'
+aux_label = 'Next_Hour_Temperature'
+
+
+# %%
+
+
+# drop the samples that are of 0 load
+filt = filt = (df_train['Next_Hour_Load'] == 0) | (df_train['Next_Hour_Load'] <= 1000)
+df_train = df_train.drop(df_train.loc[filt].index)
+
+
+# %%
+
+
+# data imputation
+df_train = df_train.fillna(method='ffill')
+df_test = df_test.fillna(method='ffill')
+
+
+# %%
+
+
+X = df_train[features]
+y_main = df_train[main_label]
+y_aux = df_train[aux_label]
+
+
+# %%
+
+
+X_test = df_test[features]
+y_test_main = df_test[main_label]
+y_test_aux = df_test[aux_label]
+
+
+# %%
+
+
+scaler = MinMaxScaler(feature_range=(-1, 1))
+scaler.fit(X)
+X_transformed = scaler.transform(X)
+X = pd.DataFrame(X_transformed, columns=X.columns, index=X.index)
+
+
+# %%
+
+
+X_test_transformed = scaler.transform(X_test)
+X_test = pd.DataFrame(X_test_transformed,
+                      columns=X_test.columns, index=X_test.index)
+
+
+# %%
+
+#驗證集
+val_filt = (X.index >= '2020-11-01')
+
+# val_filt = (X.index >= '2020-01-01') & (X.index < '2020-05-01')
+
+X_val = X.loc[val_filt]
+y_val_main = y_main.loc[val_filt]
+y_val_aux = y_aux.loc[val_filt]
+
+X_train = X.loc[~val_filt]
+y_train_main = y_main.loc[~val_filt]
+y_train_aux = y_aux.loc[~val_filt]
+
+
+# %%
+
+
+# val_filt = (X.index >= '2020-11-01')
+# X_val = X.loc[val_filt]
+# y_val_main = y_main.loc[val_filt]
+# y_val_aux = y_aux.loc[val_filt]
+
+
+# %%
+
+
+# num_transformer is a transformer for numerical variables
+num_transformer = Pipeline(steps=[
+    ('scaler', MinMaxScaler(feature_range=(-1, 1)))
+])
+
+
+# %%
+
+
+# cat_transformer is a transformer for category variables
+cat_transformer = Pipeline(steps=[
+    ('ohe', OneHotEncoder(handle_unknown='ignore'))
+])
+
+
+# %%
+
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', num_transformer, num_features),
+        ('cat', cat_transformer, cat_features)],
+    remainder='passthrough')
+
+
+# %%
+X = preprocessor.fit_transform(X)
+
+X_train = preprocessor.fit_transform(X_train)
+#X_train = X_train.toarray()
+# df_train_processed = pd.DataFrame(df_train_processed, index=index_X)
+
+
+# %%
+
+
+X_val = preprocessor.transform(X_val)
+#X_val = X_val.toarray()
+# df_test_processed = pd.DataFrame(df_test_processed, index=index_X_test)
+
+
+# %%
+
+
+X_test = preprocessor.transform(X_test)
+#X_test = X_test.toarray()
+
+
+# %%
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+batch_size = 64
+print(device)
+
+
+# %%
+#將訓練集、測試集、驗證集的feature跟label聚集成array
+
+train_val_dataset = ArrayDataset(X, y_main, y_aux)
+train_dataset = ArrayDataset(X_train, y_train_main, y_train_aux)
+val_dataset = ArrayDataset(X_val, y_val_main, y_val_aux)
+test_dataset = ArrayDataset(X_test, y_test_main, y_test_aux)
+
+
+# %%
+
+train_val_loader = DataLoader(dataset=train_val_dataset, batch_size=batch_size, shuffle=True)
+
+train_loader = DataLoader(dataset=train_dataset,
+                          batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(dataset=val_dataset,
+                        batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(dataset=test_dataset,
+                         batch_size=batch_size, shuffle=False)
+
+
+# %%
+
+
+print(f'training size: {len(train_dataset)}, validation size: {len(val_dataset)}, test size:{len(test_dataset)}')
+
+
+# %%
+criterion_main = nn.L1Loss()
+criterion_aux = nn.L1Loss() 
+#取预测值和真实值的绝对误差的平均数
+
+
+# %%
+
+
+ensemble_train_losses = []
+ensemble_val_losses = []
+ensemble_predictions = []
+
+
+# %%
+
+
+input_size = X_train.shape[1]
+print(f'input size {input_size}')
+
+
+# %%
+def modelReTrain(model, train_loader):
+    model.train()
+
+#     criterion_main = nn.L1Loss()
+#     criterion_aux = nn.L1Loss()  
+
+#     learning_rate = 0.05
+#     optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(
+#         0.9, 0.99), eps=1e-08, weight_decay=0.0001, amsgrad=False)
+#     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+#         optimizer, patience=5, verbose=True)
+
+    lr = get_lr(optimizer)
+    print(f'Re-train the model with learning rate = {lr}')
+    
+    losses = []
+    losses_main = []
+    losses_aux = []
+    size = 0
+    for idx, (samples, main_labels, aux_labels) in enumerate(train_loader):
+        samples = samples.to(device)
+        main_labels = main_labels.to(device)
+        aux_labels = aux_labels.to(device)
+        outputs_main, outputs_aux = model(samples)
+        outputs_main = outputs_main.reshape(-1)
+        outputs_aux = outputs_aux.reshape(-1)
+
+        optimizer.zero_grad()
+
+#計算train、val的loss並做backward
+        loss_main = criterion_main(outputs_main, main_labels)
+        loss_aux = criterion_aux(outputs_aux, aux_labels)
+#         ratio = loss_aux/loss_main
+        losses.append(loss_main.item() + loss_aux.item())
+        losses_main.append(loss_main.item())
+        losses_aux.append(loss_aux.item())
+        loss = loss_main + torch.mul(loss_aux, weight)  #將溫度預測的loss乘上165
+        loss.backward()
+        optimizer.step()
+    mean_loss = sum(losses)/len(losses)
+    mean_loss_main = sum(losses_main)/len(losses_main)
+    mean_loss_aux = sum(losses_aux)/len(losses_aux)
+    train_losses.append(mean_loss)
+#     scheduler.step(mean_loss)
+    
+    return train_losses, mean_loss, mean_loss_main, mean_loss_aux
+    
+
+
+# %%
+def modelTrain(model, train_loader):
+    model.train()
+
+#     criterion_main = nn.L1Loss()
+#     criterion_aux = nn.L1Loss()  
+
+#     learning_rate = 0.05
+#     optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(
+#         0.9, 0.99), eps=1e-08, weight_decay=0.0001, amsgrad=False)
+#     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+#         optimizer, patience=5, verbose=True)
+
+#     lr = get_lr(optimizer)
+#     print(f'Train the model with learning rate = {lr}')
+
+    losses = []
+    losses_main = []
+    losses_aux = []
+    size = 0
+    for idx, (samples, main_labels, aux_labels) in enumerate(train_loader):
+        samples = samples.to(device)
+        main_labels = main_labels.to(device)
+        aux_labels = aux_labels.to(device)
+        outputs_main, outputs_aux = model(samples)
+        outputs_main = outputs_main.reshape(-1)
+        outputs_aux = outputs_aux.reshape(-1)
+
+        optimizer.zero_grad()
+
+        loss_main = criterion_main(outputs_main, main_labels)
+        loss_aux = criterion_aux(outputs_aux, aux_labels)
+#         ratio = loss_aux/loss_main
+        losses.append(loss_main.item() + loss_aux.item())
+        losses_main.append(loss_main.item())
+        losses_aux.append(loss_aux.item())
+        loss = loss_main + torch.mul(loss_aux, weight)
+        loss.backward()
+        optimizer.step()
+    mean_loss = sum(losses)/len(losses)
+    mean_loss_main = sum(losses_main)/len(losses_main)
+    mean_loss_aux = sum(losses_aux)/len(losses_aux)
+    train_losses.append(mean_loss)
+    scheduler.step(mean_loss)
+    
+    return train_losses, mean_loss, mean_loss_main, mean_loss_aux
+    
+
+
+# %%
+def modelValidate(model, val_loader):
+    model.eval()
+    with torch.no_grad():
+        for val_samples, val_main_labels, val_aux_labels in val_loader:
+            val_samples = val_samples.to(device)
+            val_main_labels = val_main_labels.to(device)
+            val_aux_labels = val_aux_labels.to(device)
+
+            val_outputs_main, val_outputs_aux = model(val_samples)
+            val_outputs_main = val_outputs_main.reshape(-1)
+            val_outputs_aux = val_outputs_aux.reshape(-1)
+
+            val_loss_main = criterion_main(
+                    val_outputs_main, val_main_labels)
+            val_loss_aux = criterion_aux(val_outputs_aux, val_aux_labels)
+            valid_losses.append(val_loss_main.item() + val_loss_aux.item())
+    mean_val_losses = sum(valid_losses)/len(valid_losses)
+    val_losses.append(mean_val_losses)
+    return mean_val_losses
+
+
+# %%
+def get_lr(optimizer):
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+
+
+# %%
+warm_up = 50
+weight = 165
+epochs = 500
+num_of_ensembles = 10
+model_file_names = []
+#alpha = 500
+for ensemble in range(num_of_ensembles):
+    print(f'Ensemble Step {ensemble+1}')
+    train_losses = []
+    val_losses = []
+    total_step = len(train_loader)
+    early_stop = False
+    model_saving = True
+
+#     learning_rate = 0.1
+    model = MTLNet(input_size).to(device)
+    
+    prev_mean_val_losses = 0
+    count = 0
+    
+    training_over = False
+
+    learning_rate = 0.05
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(
+        0.9, 0.99), eps=1e-08, weight_decay=0.0001, amsgrad=False)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.05, patience=5, verbose=True)
+    
+    for epoch in np.arange(epochs):
+        train_losses, mean_loss, mean_loss_main, mean_loss_aux = modelTrain(model, train_loader)
+        valid_losses = []
+    
+        mean_val_losses = modelValidate(model, val_loader)        
+        if epoch >= warm_up:
+            if epoch == warm_up:
+                prev_mean_val_losses = 9999999
+            elif mean_val_losses > prev_mean_val_losses:
+                count += 1
+                
+#                 if model_saving:
+#                     now = datetime.now()
+#                     timestamp = now.strftime("%y_%m_%d_%H_%M_%S")
+#                     model_filePath = f'./model/model_{epoch + 1}_{timestamp}.pth'
+#                     print(f"Saving the model...model name: {model_filePath}")
+#                     state_dict_filePath = f'./model/state_dict_ensemble_{epoch + 1}_{timestamp}.pth'
+#                     saveModel(model, model_filePath, state_dict_filePath)   
+#                     model_saving = False
+                
+            else:
+                prev_mean_val_losses = mean_val_losses
+                count = 0
+                model_saving = True
+
+            if count >= 30:
+                print('================ Early stop ================') #現在的loss一直大於之前的loss
+                print(f'mean validation loss: {prev_mean_val_losses:.2f}')
+                early_stop = True
+#                 model_file_names.append(model_filePath)
+                count = 0
+                
+                training_over = True
+                
+                
+#                 print(f"Saving the model...model name: {model_filePath}")
+#                 state_dict_filePath = f'./model/state_dict_ensemble_{epoch + 1}_{timestamp}.pth'
+#                 saveModel(model, model_filePath, state_dict_filePath)   
+                    
+                
+             
+                break        
+#             print(f'Count: {count}, base mean validation loss: {prev_mean_val_losses:.2f}')
+
+        if (epoch+1) % 10 ==0:
+            print(f'Epoch {epoch+1}: average training loss is {mean_loss:.2f}, validation loss is {mean_val_losses:.2f}, main task loss: {mean_loss_main:.2f}, auxiliary task loss: {mean_loss_aux:.2f}')
+    
+    if training_over:
+        learning_rate = 0.0001
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(
+        0.9, 0.99), eps=1e-08, weight_decay=0.0001, amsgrad=False)        
+#         lr = get_lr(optimizer)
+#         print(f'Re-train the model by using the whole training set with learning rate = {lr}')
+        for e in np.arange(20):
+            train_losses, mean_loss, mean_loss_main, mean_loss_aux = modelReTrain(model, train_val_loader)
+            print(f'Epoch {e+1}: average training loss is {mean_loss:.2f}, main task loss: {mean_loss_main:.2f}, auxiliary task loss: {mean_loss_aux:.2f}')
+
+        now = datetime.now()
+        timestamp = now.strftime("%y_%m_%d_%H_%M_%S")
+        #model_filePath = f'./model/model_{epoch + 1}_{timestamp}.pth'
+        model_filePath = f'C:/Users/user/Desktop/負載規劃/2021/muti-task learning/model/model_{epoch + 1}_{timestamp}.pth'
+        print(f"Saving the model...model name: {model_filePath}")
+        state_dict_filePath = f'C:/Users/user/Desktop/負載規劃/2021/muti-task learning/model/state_dict_ensemble_{epoch + 1}_{timestamp}.pth'
+        saveModel(model, model_filePath, state_dict_filePath)   
+        
+        model_file_names.append(model_filePath)
+                    
+
+
+# %%
+fig, ax = plt.subplots(figsize=(10,8))
+train_losses = train_losses[1:]
+
+ax.plot(range(1, len(train_losses)+1), train_losses, label='training loss')
+ax.plot(range(1, len(val_losses)+1), val_losses, label='validation loss')
+plt.legend()
+
+
+# %%
+predictions = modelEvaluation(model, test_loader)    
+MAE = mean_absolute_error(y_test_main, predictions)
+MSE = mean_squared_error(y_test_main, predictions)
+RMSE = np.sqrt(MSE)
+
+print(f'Final model: MAE: {MAE:.2f}, RMSE: {RMSE:.2f}, MSE: {MSE:.2f}')
+
+# %%
+#紀錄十次結果
+ensemble_predictions = []
+MAE_list = []
+RMSE_list = []
+MSE_list = []
+for f in model_file_names:
+    model = torch.load(f)
+    predictions = modelEvaluation(model, test_loader)    
+    MAE = mean_absolute_error(y_test_main, predictions)
+    MSE = mean_squared_error(y_test_main, predictions)
+    RMSE = np.sqrt(MSE)
+    
+    MAE_list.append(MAE)
+    RMSE_list.append(RMSE)
+    MSE_list.append(MSE)
+    
+    print(f'model {f}, MAE: {MAE:.2f}, RMSE: {RMSE:.2f}, MSE: {MSE:.2f}')
+    
+    ensemble_predictions.append(predictions)
+    
+
+
+# %%
+
+
+# len(ensemble_predictions)
+
+
+# %%
+
+
+# if early_stop:
+#     model = torch.load(model_filePath)
+
+
+# %%
+
+
+# model.eval()
+# predictions = []
+# with torch.no_grad():
+#     for test_samples, test_main_labels, test_aux_labels in test_loader:
+#         test_samples = test_samples.to(device)
+#         test_main_labels = test_main_labels.to(device)
+#         test_outputs_main, test_outputs_aux = model(test_samples)
+#         test_outputs_main = torch.squeeze(test_outputs_main, dim=1)
+#         predictions.extend(test_outputs_main.cpu().detach().numpy())
+
+#     ensemble_predictions.append(predictions)
+
+
+# %%
+final_predictions = [np.mean(predictions)
+                     for predictions in zip(*ensemble_predictions)]
+MAE = mean_absolute_error(y_test_main, final_predictions)
+MSE = mean_squared_error(y_test_main, final_predictions)
+RMSE = np.sqrt(MSE)
+
+print(f'Ensemble {len(ensemble_predictions)} Model performance: MAE = {MAE:.2f}, MSE={MSE:.2f} RMSE:{RMSE:.2f}')
+
+
+# %%
+
+
+print(f'Average Performance for {len(MAE_list)} models is: MAE: {np.mean(MAE_list):.2f}, RMSE: {np.mean(RMSE_list):.2f}, MSE: {np.mean(MSE_list):.2f}')
+print(f'Performance Standard Deviation for {len(MAE_list)} models is: MAE: {np.std(MAE_list):.2f}, RMSE: {np.std(RMSE_list):.2f}, MSE: {np.std(MSE_list):.2f}')
+
+
+
+# %%
+
+
+# #save the model
+# now = datetime.now()
+# timestamp = now.strftime("%y_%m_%d_%H_%M_%S")
+# print(f"Saving the model...model name: {timestamp}")
+# model_filePath = f'./model/model_{epoch + 1}_{timestamp}.pth'
+# torch.save(model, model_filePath)
+# state_dict_filePath = f'./model/state_dict_ensemble_{epoch + 1}_{timestamp}.pth'
+# torch.save(model.state_dict(), state_dict_filePath)
+
+
+# %%
+
+
+# outputFileName = model_filePath + "_performance.txt"
+# with open(outputFileName, 'w') as f:
+#     f.write(
+#         f'Model performance: MAE = {MAE:.2f}, MSE={MSE:.2f}, RMSE={RMSE:.2f}')
+
+
+# %%
+
+
+# # save model file
+# fileName = model_filePath + '.pickle'
+# with open('mypickle.pickle', 'wb') as f:
+#     pickle.dump(model_file_names, f)
+
+
+# %%
+
+
+
+
